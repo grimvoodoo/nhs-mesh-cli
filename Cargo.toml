@@ -1,0 +1,19 @@
+[package]
+name = "nhs-mesh-cli"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+chrono = "0.4.31"
+env_logger = "0.10.1"
+hex = "0.4.3"
+hmac = "0.12.1"
+log = "0.4.20"
+rand = "0.8.5"
+reqwest = {version = "0.11.22", features = ["json"]}
+serde = "1.0.193"
+serde_json = "1.0.108"
+sha2 = "0.10.8"
+tokio = { version = "1", features = ["full"] }
