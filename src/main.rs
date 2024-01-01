@@ -1,36 +1,29 @@
 use chrono::Utc;
-use env_logger::fmt::Timestamp;
+
 use hmac::{Hmac, Mac};
 use log::{debug, error, info};
-use rand::{random, rngs::OsRng, Rng, RngCore};
+
 use reqwest::{
-    header::{HeaderMap, HeaderValue, DATE},
-    Client, Error,
+    header::{HeaderMap, HeaderValue},
+    Client, Error, Response,
 };
-use serde_json::{json, Value};
+use serde_json::Value;
 use sha2::Sha256;
-use std::{
-    collections::HashMap,
-    env,
-    fmt::format,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashMap, env};
+use uuid::{self, Uuid};
+
+const AUTH_SCHEMA_NAME: &str = "NHSMESH";
+const SHARED_KEY: &str = "TestKey";
 
 pub struct Mailbox {
     url: String,
     id: String,
     password: String,
-    shared_key: String,
 }
 
 impl Mailbox {
-    pub fn new(url: String, id: String, password: String, shared_key: String) -> Self {
-        Mailbox {
-            url,
-            id,
-            password,
-            shared_key,
-        }
+    pub fn new(url: String, id: String, password: String) -> Self {
+        Mailbox { url, id, password }
     }
 }
 
@@ -38,68 +31,68 @@ impl Mailbox {
 async fn main() {
     env::set_var("RUST_LOG", "info");
     env_logger::init();
-    let mailbox = Mailbox::new(
-        "https://kube-controller-1:30443".to_string(),
-        "X26ABC1".to_string(),
-        "password".to_string(),
-        "TestKey".to_string(),
+    let sender_mailbox = Mailbox::new(
+        "https://localhost:8700".to_string(),
+        env::var("MESH_SENDER_MAILBOX_ID").unwrap_or("X26ABC1".to_string()),
+        env::var("SENDER_MESH_PASSWORD").unwrap_or("password".to_string()),
+    );
+    let reciever_mailbox = Mailbox::new(
+        "https://localhost:8700".to_string(),
+        env::var("MESH_RECEIVER_MAILBOX_ID").unwrap_or("X26ABC2".to_string()),
+        env::var("RECIEVER_MESH_PASSWORD").unwrap_or("password".to_string()),
     );
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
         .expect("Failed to build client");
-    info!("Performing healthcheck on mesh url");
-    match health_check(&client, &mailbox).await {
-        Ok(json) => info!("Success: {:?}", json),
+    info!("\n\n Performing healthcheck on mesh url");
+    match health_check(&client, &sender_mailbox).await {
+        Ok(json) => info!("Sender mailbox healthy: {:?}", json["status"]),
         Err(e) => error!("Error: {:?}", e),
     }
-    match handshake(&client, &mailbox).await {
+    match health_check(&client, &reciever_mailbox).await {
+        Ok(json) => info!("Reciever mailbox healthy: {:?}", json["status"]),
+        Err(e) => error!("Error: {:?}", e),
+    }
+    info!("\n\n Performing handshake on mailboxes");
+    match handshake(&client, &sender_mailbox).await {
+        Ok(json) => info!("Success {:?}", json),
+        Err(e) => error!("Failure: {:?}", e),
+    }
+    match handshake(&client, &reciever_mailbox).await {
         Ok(json) => info!("Success {:?}", json),
         Err(e) => error!("Failure: {:?}", e),
     }
 }
 
-async fn create_hmac_sha256_hex(
-    mailbox: &Mailbox,
-    message: String,
-) -> Result<String, Box<dyn std::error::Error>> {
-    type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(mailbox.shared_key.as_bytes())?;
-    mac.update(&message.into_bytes());
+async fn generate_token(mailbox: &Mailbox) -> String {
+    let nonce = Uuid::new_v4().to_string();
+    let nonce_count = 0;
 
-    let result = mac.finalize();
-    let result_bytes = result.into_bytes();
-    Ok(hex::encode(result_bytes))
-}
-
-async fn generate_token(mailbox: &Mailbox) -> Result<String, Box<dyn std::error::Error>> {
-    let since_the_epoch = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Time is running backwards!");
-    let random_number = rand::thread_rng().gen_range(0..1000);
-    let nonce = format!("{}{}", since_the_epoch.as_secs(), random_number);
-    let timestamp_formatted = Utc::now().format("%Y%m%d%H%M%S").to_string();
-    let timestamp = timestamp_formatted.get(0..12).unwrap();
-    let auth_schema_name = "NHSMESH ".to_string();
-    let hmac_msg = format!("{}{}{}{}", &mailbox.id, nonce, mailbox.password, &timestamp);
-    let mut hmac: String = Default::default();
-    match create_hmac_sha256_hex(&mailbox, hmac_msg).await {
-        Ok(hmac_hex) => {
-            hmac = hmac_hex;
-        }
-        Err(e) => error!("Failure: {:?}", e),
-    }
-    let token = format!(
-        "{}{}{}{}{}",
-        auth_schema_name, &mailbox.id, nonce, timestamp, hmac
+    let timestamp = Utc::now().format("%Y%m%d%H%M").to_string();
+    let hmac_msg = format!(
+        "{}:{}:{}:{}:{}",
+        mailbox.id, nonce, nonce_count, mailbox.password, timestamp
     );
-    Ok(token)
+
+    debug!("{:?}", hmac_msg);
+
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(SHARED_KEY.as_bytes()).expect("can work with any size");
+    mac.update(hmac_msg.as_bytes());
+
+    let hash_code = hex::encode(mac.finalize().into_bytes());
+
+    format!(
+        "{} {}:{}:{}:{}:{}",
+        AUTH_SCHEMA_NAME, mailbox.id, nonce, nonce_count, timestamp, hash_code
+    )
 }
 
 async fn generate_headers(
     mailbox: &Mailbox,
 ) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
-    let token = generate_token(mailbox).await?;
+    let token = generate_token(mailbox).await;
     let mut headers = HashMap::new();
     headers.insert(
         "accept".to_string(),
@@ -116,8 +109,8 @@ async fn generate_headers(
         "mex-osversion".to_string(),
         "#44~18.04.2-Ubuntu".to_string(),
     );
-    headers.insert("Content-Type".to_string(), "application/json".to_string());
-
+    // headers.insert("Content-Type".to_string(), "application/json".to_string());
+    debug!("{:?}", headers);
     Ok(headers)
 }
 
@@ -133,8 +126,8 @@ async fn health_check(client: &Client, mailbox: &Mailbox) -> Result<Value, Error
     }
 }
 
-async fn handshake(client: &Client, mailbox: &Mailbox) -> Result<Value, Error> {
-    let url = format!("{}/messageexchange/X26ABC1", mailbox.url);
+async fn handshake(client: &Client, mailbox: &Mailbox) -> Result<Response, Error> {
+    let url = format!("{}/messageexchange/{}", mailbox.url, mailbox.id);
     let headers = generate_headers(mailbox).await.unwrap();
     let mut header_map = HeaderMap::new();
     for (key, value) in headers {
@@ -146,9 +139,10 @@ async fn handshake(client: &Client, mailbox: &Mailbox) -> Result<Value, Error> {
 
     let response = client.get(url).headers(header_map).send().await?;
 
+    debug!("Raw response is: {:?}", response);
+
     if response.status().is_success() {
-        let json_body = response.json().await?;
-        Ok(json_body)
+        Ok(response)
     } else {
         Err(response.error_for_status().unwrap_err())
     }
